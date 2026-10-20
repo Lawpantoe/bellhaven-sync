@@ -166,7 +166,7 @@ def _address_evidence(
         same_city_state
         and name_similarity >= 85
         and address_differs
-        and not street_completely_different
+        and (not street_completely_different or name_similarity >= 95)
         and not zip_mismatch_match
         and not po_box_match
     )
@@ -326,6 +326,29 @@ def _location_changes(
     return changes
 
 
+def _address_fix_changes(
+    account: dict[str, Any], location: dict[str, Any]
+) -> dict[str, Any] | None:
+    changes: dict[str, Any] = {}
+    current_street = str(account.get("billing_street") or "").strip()
+    website_street = str(location.get("street") or "").strip()
+    current_zip = str(account.get("billing_zip") or "").strip()
+    website_zip = str(location.get("zip") or "").strip()
+
+    if website_street and current_street and current_street.casefold() != website_street.casefold():
+        if PO_BOX_RE.match(current_street) and website_street.casefold() not in current_street.casefold():
+            changes["billing_street"] = f"{current_street}, {website_street}"
+        else:
+            changes["billing_street"] = website_street
+
+    if website_zip and current_zip and current_zip != website_zip:
+        changes["billing_zip"] = website_zip
+
+    if not changes:
+        return None
+    return changes
+
+
 def _match_proposals(
     account: dict[str, Any],
     location: dict[str, Any],
@@ -340,6 +363,25 @@ def _match_proposals(
     }
 
     if address_evidence["po_box_match"]:
+        billing_street = str(account.get("billing_street") or "").strip()
+        website_street = str(location.get("street") or "").strip()
+        if website_street and website_street.casefold() not in billing_street.casefold():
+            return [
+                _proposal(
+                    "fix_address",
+                    account,
+                    location,
+                    {"billing_street": f"{billing_street}, {website_street}"},
+                    {
+                        **evidence,
+                        "reason": (
+                            "Billing address is a PO Box; add the website street "
+                            "while retaining the PO Box."
+                        ),
+                    },
+                    suffix,
+                )
+            ]
         return [
             _proposal(
                 "confident_match",
@@ -621,26 +663,41 @@ def build_proposals(
 
         if weak_matches:
             for account, evidence in weak_matches:
-                proposals.append(
-                    _proposal(
-                        "needs_review",
-                        account,
-                        location,
-                        {},
-                        {
-                            **evidence,
-                            "reason": "Weak name and city/state match; address differs.",
-                        },
+                fix_changes = _address_fix_changes(account, location)
+                if fix_changes is not None:
+                    proposals.append(
+                        _proposal(
+                            "fix_address",
+                            account,
+                            location,
+                            fix_changes,
+                            {
+                                **evidence,
+                                "reason": "Weak name and city/state match; website address is the stronger CRM correction.",
+                            },
+                        )
                     )
-                )
-                uncertain.append(
-                    {
-                        "kind": "weak_match",
-                        "account_id": account.get("account_id"),
-                        "website_url": location.get("url"),
-                        "reason": "Name and city/state suggest a possible match, but the address differs.",
-                    }
-                )
+                else:
+                    proposals.append(
+                        _proposal(
+                            "needs_review",
+                            account,
+                            location,
+                            {},
+                            {
+                                **evidence,
+                                "reason": "Weak name and city/state match; address differs.",
+                            },
+                        )
+                    )
+                    uncertain.append(
+                        {
+                            "kind": "weak_match",
+                            "account_id": account.get("account_id"),
+                            "website_url": location.get("url"),
+                            "reason": "Name and city/state suggest a possible match, but the address differs.",
+                        }
+                    )
             continue
 
         offering = next(

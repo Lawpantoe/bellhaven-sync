@@ -78,6 +78,31 @@ class CRMApplyTests(unittest.TestCase):
 
     @patch("crm.patch_account")
     @patch("crm.get_account")
+    def test_changed_snapshot_ignores_unrelated_fields(
+        self, get_account: unittest.mock.Mock, patch_account: unittest.mock.Mock
+    ) -> None:
+        proposal = {
+            **self.proposal,
+            "type": "reparent",
+            "current_crm_values": {
+                "name": "Old name",
+                "parent_id": "other-parent",
+                "lifetime_revenue": 0,
+            },
+            "proposed_field_changes": {"parent_id": crm.PARENT_ACCOUNT_ID},
+        }
+        get_account.side_effect = [
+            {"account_id": "account-1", "name": "Updated name", "parent_id": "other-parent", "lifetime_revenue": 0},
+            {"account_id": "account-1", "parent_id": crm.PARENT_ACCOUNT_ID},
+        ]
+
+        result = crm.apply_approved_proposal(proposal)
+
+        patch_account.assert_called_once_with("account-1", {"parent_id": crm.PARENT_ACCOUNT_ID})
+        self.assertIn("verified", result)
+
+    @patch("crm.patch_account")
+    @patch("crm.get_account")
     def test_update_patches_only_proposed_fields_and_verifies(
         self, get_account: unittest.mock.Mock, patch_account: unittest.mock.Mock
     ) -> None:
@@ -130,6 +155,45 @@ class CRMApplyTests(unittest.TestCase):
         result = crm.apply_approved_proposal(proposal)
 
         patch_account.assert_called_once_with("account-1", {"billing_zip": "45662"})
+        self.assertIn("verified", result)
+
+    @patch("crm.patch_account")
+    @patch("crm.get_account")
+    def test_fix_address_can_add_street_while_preserving_po_box(
+        self, get_account: unittest.mock.Mock, patch_account: unittest.mock.Mock
+    ) -> None:
+        combined_street = "PO Box 517, 3156 W Prospect Rd"
+        proposal = {
+            **self.proposal,
+            "type": "fix_address",
+            "current_crm_values": {
+                "name": "Bellhaven of Ashtabula",
+                "billing_street": "PO Box 517",
+                "billing_city": "Ashtabula",
+                "billing_state": "OH",
+                "billing_zip": "44004",
+                "lifetime_revenue": 0,
+            },
+            "proposed_field_changes": {"billing_street": combined_street},
+        }
+        get_account.side_effect = [
+            {
+                "account_id": "account-1",
+                "name": "Bellhaven of Ashtabula",
+                "billing_street": "PO Box 517",
+                "billing_city": "Ashtabula",
+                "billing_state": "OH",
+                "billing_zip": "44004",
+                "lifetime_revenue": 0,
+            },
+            {"account_id": "account-1", "billing_street": combined_street},
+        ]
+
+        result = crm.apply_approved_proposal(proposal)
+
+        patch_account.assert_called_once_with(
+            "account-1", {"billing_street": combined_street}
+        )
         self.assertIn("verified", result)
 
     @patch("crm.patch_account")

@@ -63,7 +63,7 @@ class MatcherClassificationTests(unittest.TestCase):
         self.assertEqual(proposal["proposed_field_changes"], {"billing_zip": "45662"})
         self.assertEqual(proposal["account_id"], "portsmouth")
 
-    def test_matching_po_box_address_is_confident_without_address_changes(self) -> None:
+    def test_matching_po_box_proposes_combined_billing_street(self) -> None:
         account = _account(
             "ashtabula", "Bellhaven of Ashtabula", "PO Box 517",
             "Ashtabula", "OH", "44004",
@@ -77,14 +77,37 @@ class MatcherClassificationTests(unittest.TestCase):
 
         self.assertEqual(len(result["proposals"]), 1)
         proposal = result["proposals"][0]
-        self.assertEqual(proposal["type"], "confident_match")
-        self.assertEqual(proposal["proposed_field_changes"], {})
-        self.assertEqual(proposal["evidence"]["reason"], "billing address is a PO Box")
+        self.assertEqual(proposal["type"], "fix_address")
+        self.assertEqual(
+            proposal["proposed_field_changes"],
+            {"billing_street": "PO Box 517, 3156 W Prospect Rd"},
+        )
+        self.assertIn("retaining the PO Box", proposal["evidence"]["reason"])
 
-    def test_completely_different_street_creates_new_account(self) -> None:
+    def test_weak_city_name_match_updates_crm_address_for_same_location(self) -> None:
         existing = _account(
             "union-square", "Union Square Senior Living", "240 Market St",
             "New Albany", "OH", "43054", parent_id="other-parent",
+        )
+        location = _location(
+            "Bellhaven at Union Square", "118 Union Square Dr",
+            "New Albany", "OH", "43054", "union-square",
+        )
+
+        result = build_proposals([_parent(), existing], [location])
+
+        self.assertEqual(len(result["proposals"]), 1)
+        proposal = result["proposals"][0]
+        self.assertEqual(proposal["type"], "fix_address")
+        self.assertEqual(
+            proposal["proposed_field_changes"],
+            {"billing_street": "118 Union Square Dr"},
+        )
+
+    def test_completely_different_street_creates_new_account(self) -> None:
+        existing = _account(
+            "other-campus", "Other Senior Living", "100 Main St",
+            "Columbus", "OH", "43215", parent_id="other-parent",
         )
         location = _location(
             "Bellhaven at Union Square", "118 Union Square Dr",

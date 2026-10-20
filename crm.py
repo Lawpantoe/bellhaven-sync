@@ -128,18 +128,21 @@ def _same_value(expected: Any, actual: Any) -> bool:
 
 
 def _check_proposal_snapshot(
-    account_id: str, expected_values: dict[str, Any]
+    account_id: str,
+    expected_values: dict[str, Any],
+    changed_fields: set[str] | None = None,
 ) -> dict[str, Any]:
     account = get_account(account_id)
-    changed_fields = [
-        field
-        for field, expected in expected_values.items()
-        if not _same_value(expected, account.get(field))
+    fields_to_check = expected_values if changed_fields is None else {
+        field: expected_values[field] for field in sorted(changed_fields) if field in expected_values
+    }
+    mismatched_fields = [
+        field for field, expected in fields_to_check.items() if not _same_value(expected, account.get(field))
     ]
-    if changed_fields:
+    if mismatched_fields:
         raise CRMChangedError(
             "CRM changed since proposal "
-            f"(changed fields: {', '.join(sorted(changed_fields))})."
+            f"(changed fields: {', '.join(sorted(mismatched_fields))})."
         )
     return account
 
@@ -201,14 +204,17 @@ def apply_approved_proposal(proposal: dict[str, Any]) -> str:
     expected_values = proposal.get("current_crm_values")
     if not isinstance(expected_values, dict):
         raise ValueError("Proposal is missing current CRM values.")
-    _check_proposal_snapshot(str(account_id), expected_values)
 
     if proposal_type == "chow":
         fields = _account_fields(proposal)
         new_account_id = create_account(fields)
         try:
             _verify_fields(new_account_id, fields)
-            _check_proposal_snapshot(str(account_id), expected_values)
+            _check_proposal_snapshot(
+                str(account_id),
+                expected_values,
+                {"chow_current_account"},
+            )
             chow_field = {"chow_current_account": new_account_id}
             patch_account(str(account_id), chow_field)
             _verify_fields(str(account_id), chow_field)
@@ -231,11 +237,13 @@ def apply_approved_proposal(proposal: dict[str, Any]) -> str:
     elif proposal_type == "fix_address":
         fields = {
             field: changes[field]
-            for field in ("billing_zip",)
+            for field in ("billing_street", "billing_zip")
             if field in changes
         }
         if not fields:
-            raise ValueError("fix_address proposal is missing billing_zip.")
+            raise ValueError(
+                "fix_address proposal is missing billing_street and billing_zip."
+            )
     elif proposal_type in {"update_name", "reparent", "fill_care_type"}:
         fields = dict(changes)
     elif proposal_type == "not_on_website":
@@ -247,6 +255,7 @@ def apply_approved_proposal(proposal: dict[str, Any]) -> str:
     else:
         raise ValueError(f"Unsupported proposal type: {proposal_type}")
 
+    _check_proposal_snapshot(str(account_id), expected_values, set(fields))
     patch_account(str(account_id), fields)
     _verify_fields(str(account_id), fields)
     return f"Updated and verified CRM account {account_id}."
