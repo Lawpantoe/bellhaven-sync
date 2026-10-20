@@ -8,6 +8,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 import crm
+from matcher import PARENT_ACCOUNT_ID
 from review_db import decide_proposal, list_proposals
 
 
@@ -39,6 +40,224 @@ def _address(fields: dict[str, Any], website: bool = False) -> str:
     if postal:
         locality = f"{locality} {postal}".strip()
     return ", ".join(value for value in (street, locality) if value)
+
+
+def _load_accounts() -> dict[str, dict[str, Any]]:
+    path = Path("data") / "crm_accounts.json"
+    if not path.is_file():
+        return {}
+    accounts = json.loads(path.read_text(encoding="utf-8"))
+    return {str(account["account_id"]): account for account in accounts}
+
+
+def _display_value(value: Any) -> str:
+    return str(value).strip() if value not in (None, "") else "(blank)"
+
+
+def _money(value: Any) -> str:
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        return _display_value(value)
+    return f"${amount:,.0f}" if amount.is_integer() else f"${amount:,.2f}"
+
+
+def _account_has_billing_history(account: dict[str, Any]) -> bool:
+    try:
+        revenue = float(account.get("lifetime_revenue") or 0)
+        outstanding = float(account.get("outstanding_ar") or 0)
+    except (TypeError, ValueError):
+        return False
+    return revenue > 0 or outstanding > 0
+
+
+def _account_completeness(account: dict[str, Any]) -> int:
+    fields = (
+        "name",
+        "billing_street",
+        "billing_city",
+        "billing_state",
+        "billing_zip",
+        "care_type",
+        "status",
+    )
+    return sum(bool(account.get(field)) for field in fields)
+
+
+def _proposal_reason(
+    proposal: dict[str, Any],
+    website: dict[str, Any],
+    accounts: dict[str, dict[str, Any]],
+) -> str:
+    proposal_type = str(proposal.get("type") or "")
+    evidence = proposal.get("evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    current = proposal.get("current_crm_values")
+    current = current if isinstance(current, dict) else {}
+    changes = proposal.get("proposed_field_changes")
+    changes = changes if isinstance(changes, dict) else {}
+    website_address = _address(website, website=True) or "(not available)"
+    crm_address = _address(current) or "(not available)"
+    website_name = str(website.get("name") or "website location")
+    crm_name = str(current.get("name") or "CRM account")
+
+    if proposal_type == "needs_review":
+        if evidence.get("weak_match"):
+            score = evidence.get("name_similarity", "unknown")
+            return (
+                f"Weak match: same city/state and similar name (score {score}), "
+                f"but the address differs: website {website_address} vs CRM "
+                f"{crm_address}."
+            )
+        reason = evidence.get("reason") or "the available match evidence is inconclusive"
+        return (
+            f"Manual review is needed because {reason} Website address: "
+            f"{website_address}; CRM address: {crm_address}."
+        )
+
+    if proposal_type == "not_on_website":
+        return (
+            "This account is under Bellhaven in the CRM, but no location on the "
+            "Bellhaven website matches its address or name."
+        )
+
+    if proposal_type in {"reparent", "chow"}:
+        target_parent_id = changes.get("parent_id")
+        if proposal_type == "chow":
+            create_fields = changes.get("create_account")
+            if isinstance(create_fields, dict):
+                target_parent_id = create_fields.get("parent_id")
+        target_parent = accounts.get(str(target_parent_id), {})
+        target_parent_name = (
+            target_parent.get("name") or target_parent_id or "(not specified)"
+        )
+        current_parent = (
+            current.get("parent_name")
+            or current.get("parent_id")
+            or "(none)"
+        )
+        revenue = evidence.get("lifetime_revenue", current.get("lifetime_revenue"))
+        outstanding = evidence.get(
+            "outstanding_ar", current.get("outstanding_ar")
+        )
+        result = (
+            "create a new account under the target parent and link the existing "
+            "account (CHOW); do not re-parent the existing account"
+            if proposal_type == "chow"
+            else "re-parent directly"
+        )
+        return (
+            f"Current parent: {current_parent}; target parent: {target_parent_name}. "
+            f"Revenue {_money(revenue)}, AR {_money(outstanding)} -> {result}."
+        )
+
+    if proposal_type == "duplicate":
+        survivor_id = str(evidence.get("survivor_account_id") or "")
+        survivor = accounts.get(survivor_id, {})
+        survivor_name = str(survivor.get("name") or "CRM account")
+        survivor_label = (
+            f"{survivor_name} ({survivor_id})"
+            if survivor_id
+            else survivor_name
+        )
+        duplicate_location = website_address
+        reasons: list[str] = []
+        if survivor:
+            bellhaven_parent = (
+                str(survivor.get("parent_id") or "") == PARENT_ACCOUNT_ID
+            )
+            loser_in_bellhaven = (
+                str(current.get("parent_id") or "") == PARENT_ACCOUNT_ID
+            )
+            if bellhaven_parent != loser_in_bellhaven:
+                reasons.append(
+                    "it is already under Bellhaven"
+                    if bellhaven_parent
+                    else "the other account is already under Bellhaven"
+                )
+            survivor_has_history = _account_has_billing_history(survivor)
+            loser_has_history = bool(evidence.get("has_billing_history"))
+            if survivor_has_history != loser_has_history:
+                reasons.append(
+                    "it has billing history"
+                    if survivor_has_history
+                    else "it has no billing history"
+                )
+            survivor_completeness = _account_completeness(survivor)
+            loser_completeness = _account_completeness(current)
+            if survivor_completeness != loser_completeness:
+                reasons.append(
+                    "its CRM record is more complete"
+                    if survivor_completeness > loser_completeness
+                    else "the other CRM record is more complete"
+                )
+            if reasons:
+                reasons = [reasons[0]]
+            else:
+                reasons.append("its account ID wins the final tie-break")
+        else:
+            reasons.append(
+                "the CRM survivor ranking preferred parent, billing history, "
+                "record completeness, and account-ID order"
+            )
+        return (
+            f"CRM accounts {crm_name} ({proposal.get('account_id') or 'no ID'}) and "
+            f"{survivor_label} both match website address {duplicate_location}; "
+            f"{survivor_label} was chosen as the survivor because "
+            f"{'; '.join(reasons)}."
+        )
+
+    if proposal_type == "update_name":
+        new_name = changes.get("name") or website_name
+        return (
+            f"The address matches the website location, but the CRM name "
+            f"{crm_name!r} differs from the website name {new_name!r}."
+        )
+
+    if proposal_type == "fix_address":
+        proposed = dict(current)
+        proposed.update(changes)
+        return (
+            f"The CRM billing address {crm_address} differs from the website "
+            f"address {website_address}; the proposed correction is "
+            f"{_address(proposed)}."
+        )
+
+    if proposal_type == "create_account":
+        return (
+            f"No eligible CRM account matched {website_name}; create an account "
+            f"at the website address {website_address}."
+        )
+
+    if proposal_type == "confident_match":
+        reason = evidence.get("reason")
+        if reason == "billing address is a PO Box":
+            return (
+                f"The CRM name, city, state, and ZIP match {website_name}; its "
+                "billing address is a PO Box, so the website street is not used "
+                "to change the CRM billing address."
+            )
+        score = evidence.get("name_similarity", "unknown")
+        return (
+            f"{crm_name} confidently matches {website_name} by address and name "
+            f"(name similarity score {score}); no CRM change is needed."
+        )
+
+    if proposal_type == "fill_care_type":
+        offering = evidence.get("website_care_offering", "website offering")
+        mapped = changes.get("care_type", evidence.get("mapped_care_type"))
+        return (
+            f"The CRM care type is blank, while the website lists {offering!r}; "
+            f"the offering maps to {mapped or 'no CRM care type'}."
+        )
+
+    reason = evidence.get("reason")
+    if reason:
+        return f"This {proposal_type.replace('_', ' ')} was proposed because {reason}"
+    return (
+        f"This {proposal_type.replace('_', ' ')} was proposed from the CRM and "
+        "website comparison."
+    )
 
 
 def _crm_account_url() -> str:
@@ -91,14 +310,20 @@ def _reject(record: dict[str, Any], reason: str) -> None:
 
 
 def _show_proposal(
-    record: dict[str, Any], locations: dict[str, dict[str, Any]]
+    record: dict[str, Any],
+    locations: dict[str, dict[str, Any]],
+    accounts: dict[str, dict[str, Any]],
 ) -> None:
     proposal = record["payload"]
     key = record["proposal_key"]
+    website = locations.get(str(proposal.get("website_url")), {})
+    st.markdown(
+        f"**Why this was proposed:** "
+        f"{_proposal_reason(proposal, website, accounts)}"
+    )
     st.markdown(f"**Proposal key:** `{key}`")
     st.markdown(f"**Account ID:** `{proposal.get('account_id') or 'New account'}`")
 
-    website = locations.get(str(proposal.get("website_url")), {})
     website_column, crm_column = st.columns(2)
     with website_column:
         st.markdown("#### Website")
@@ -173,10 +398,19 @@ def main() -> None:
         for record in list_proposals()
         if record["status"] != "pending"
     ]
+    all_records = list_proposals()
+    confident_records = [
+        record for record in all_records if record["type"] == "confident_match"
+    ]
     locations = _load_locations()
+    accounts = _load_accounts()
 
-    pending_tab, decided_tab = st.tabs(
-        [f"Pending ({len(pending_records)})", f"Decided ({len(decided_records)})"]
+    pending_tab, decided_tab, confident_tab = st.tabs(
+        [
+            f"Pending ({len(pending_records)})",
+            f"Decided ({len(decided_records)})",
+            f"Confident matches ({len(confident_records)})",
+        ]
     )
     with pending_tab:
         types = sorted({record["type"] for record in pending_records})
@@ -203,7 +437,7 @@ def main() -> None:
                     or "New account"
                 )
                 with st.expander(f"{name} — {record['proposal_key']}"):
-                    _show_proposal(record, locations)
+                    _show_proposal(record, locations, accounts)
 
     with decided_tab:
         if not decided_records:
@@ -215,9 +449,30 @@ def main() -> None:
                 f"{record['status']} — {record['type']} — "
                 f"{payload.get('account_id') or 'new'} — {decided_at}"
             ):
+                website = locations.get(str(payload.get("website_url")), {})
+                st.markdown(
+                    f"**Why this was proposed:** "
+                    f"{_proposal_reason(payload, website, accounts)}"
+                )
                 st.write(f"**Proposal key:** `{record['proposal_key']}`")
                 st.write(f"**Result:** {record['result_message'] or '(none)'}")
                 st.json(payload)
+
+    with confident_tab:
+        for record in confident_records:
+            payload = record["payload"]
+            website = locations.get(str(payload.get("website_url")), {})
+            name = (
+                payload.get("current_crm_values", {}).get("name")
+                or website.get("name")
+                or "Confident match"
+            )
+            with st.expander(f"{name} — {record['proposal_key']}"):
+                st.markdown(
+                    f"**Why this was proposed:** "
+                    f"{_proposal_reason(payload, website, accounts)}"
+                )
+                st.json(payload.get("evidence", {}))
 
 
 if __name__ == "__main__":
