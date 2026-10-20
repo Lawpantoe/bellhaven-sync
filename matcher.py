@@ -56,6 +56,7 @@ UNIT_RE = re.compile(r"\b(?:suite|ste|unit|apartment|apt)\b.*$|#.*$", re.I)
 WORD_RE = re.compile(r"[a-z0-9]+")
 STREET_NUMBER_RE = re.compile(r"^\s*(\d+[a-z]?)\b", re.I)
 ZIP_RE = re.compile(r"\d{5}")
+PO_BOX_RE = re.compile(r"^\s*p\.?\s*o\.?\s*box\b", re.I)
 
 
 def _words(value: Any) -> list[str]:
@@ -112,11 +113,42 @@ def _address_evidence(
     street_score = _street_score(location, account)
     same_zip = bool(location_zip and location_zip == account_zip)
     same_number = bool(location_number and location_number == account_number)
+    same_street = bool(
+        location_street
+        and account_street
+        and location_number == account_number
+        and location_street == account_street
+    )
     same_city_state = bool(
         location_city
         and location_state
         and location_city == account_city
         and location_state == account_state
+    )
+    location_name = _normalize_name(location.get("name"))
+    account_name = _normalize_name(account.get("name"))
+    name_similarity = _name_score(location, account)
+    zip_mismatch_match = bool(
+        same_city_state
+        and same_street
+        and location_zip
+        and account_zip
+        and location_zip != account_zip
+    )
+    billing_address_is_po_box = bool(
+        PO_BOX_RE.match(str(account.get("billing_street") or ""))
+    )
+    po_box_match = bool(
+        billing_address_is_po_box
+        and same_zip
+        and same_city_state
+        and location_name
+        and location_name == account_name
+    )
+    street_completely_different = bool(
+        location_street
+        and account_street
+        and not set(_words(location_street)).intersection(_words(account_street))
     )
     address_differs = (
         location_number != account_number
@@ -125,18 +157,30 @@ def _address_evidence(
         or location_city != account_city
         or location_state != account_state
     )
-    strong = same_zip and same_number and street_score >= 90
+    strong = (
+        (same_zip and same_number and street_score >= 90)
+        or zip_mismatch_match
+        or po_box_match
+    )
     weak = (
         same_city_state
-        and _name_score(location, account) >= 85
+        and name_similarity >= 85
         and address_differs
+        and not street_completely_different
+        and not zip_mismatch_match
+        and not po_box_match
     )
     return {
         "same_zip": same_zip,
+        "same_street": same_street,
         "same_street_number": same_number,
         "street_name_similarity": street_score,
         "same_city_state": same_city_state,
-        "name_similarity": _name_score(location, account),
+        "name_similarity": name_similarity,
+        "zip_mismatch_match": zip_mismatch_match,
+        "billing_address_is_po_box": billing_address_is_po_box,
+        "po_box_match": po_box_match,
+        "street_completely_different": street_completely_different,
         "strong_match": strong,
         "weak_match": weak,
         "normalized_location_street": location_street,
@@ -294,6 +338,33 @@ def _match_proposals(
         "outstanding_ar": account.get("outstanding_ar"),
         "has_billing_history": _has_billing_history(account),
     }
+
+    if address_evidence["po_box_match"]:
+        return [
+            _proposal(
+                "confident_match",
+                account,
+                location,
+                {},
+                {**evidence, "reason": "billing address is a PO Box"},
+                suffix,
+            )
+        ]
+
+    if address_evidence["zip_mismatch_match"]:
+        return [
+            _proposal(
+                "fix_address",
+                account,
+                location,
+                {"billing_zip": location.get("zip")},
+                {
+                    **evidence,
+                    "reason": "Street and city/state match; billing ZIP differs.",
+                },
+                suffix,
+            )
+        ]
 
     if account.get("parent_id") != PARENT_ACCOUNT_ID:
         revenue = _amount(account.get("lifetime_revenue"))

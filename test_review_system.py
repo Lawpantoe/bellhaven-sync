@@ -97,6 +97,42 @@ class CRMApplyTests(unittest.TestCase):
         self.assertIn("verified", result)
 
     @patch("crm.patch_account")
+    @patch("crm.get_account")
+    def test_fix_address_updates_only_billing_zip(
+        self, get_account: unittest.mock.Mock, patch_account: unittest.mock.Mock
+    ) -> None:
+        proposal = {
+            **self.proposal,
+            "type": "fix_address",
+            "current_crm_values": {
+                "name": "Old name",
+                "billing_street": "2222 Gallia St",
+                "billing_city": "Portsmouth",
+                "billing_state": "OH",
+                "billing_zip": "45626",
+                "lifetime_revenue": 0,
+            },
+            "proposed_field_changes": {"billing_zip": "45662"},
+        }
+        get_account.side_effect = [
+            {
+                "account_id": "account-1",
+                "name": "Old name",
+                "billing_street": "2222 Gallia St",
+                "billing_city": "Portsmouth",
+                "billing_state": "OH",
+                "billing_zip": "45626",
+                "lifetime_revenue": 0,
+            },
+            {"account_id": "account-1", "billing_zip": "45662"},
+        ]
+
+        result = crm.apply_approved_proposal(proposal)
+
+        patch_account.assert_called_once_with("account-1", {"billing_zip": "45662"})
+        self.assertIn("verified", result)
+
+    @patch("crm.patch_account")
     @patch("crm.create_account")
     @patch("crm.get_account")
     def test_chow_changes_only_old_accounts_chow_link(

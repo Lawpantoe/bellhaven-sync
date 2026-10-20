@@ -228,6 +228,14 @@ def apply_approved_proposal(proposal: dict[str, Any]) -> str:
             for field in ("duplicate_of_account", "status", "note")
             if field in changes
         }
+    elif proposal_type == "fix_address":
+        fields = {
+            field: changes[field]
+            for field in ("billing_zip",)
+            if field in changes
+        }
+        if not fields:
+            raise ValueError("fix_address proposal is missing billing_zip.")
     elif proposal_type in {"update_name", "reparent", "fill_care_type"}:
         fields = dict(changes)
     elif proposal_type == "not_on_website":
